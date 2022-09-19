@@ -96,7 +96,7 @@ class MysqlSessionHandler implements \SessionHandlerInterface
      */
     public function open($save_path, $name)
     {
-      
+      return true;
     }
 
     /**
@@ -107,7 +107,47 @@ class MysqlSessionHandler implements \SessionHandlerInterface
      */
     public function read($session_id)
     {
-
+        try {
+            if ($this->useTransactions) {
+                // MySQL's default isolation, REPEATABLE READ, causes deadlock for different sessions.
+                $this->db->exec('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+                $this->db->beginTransaction();
+            } else {
+                $this->unlockStatements[] = $this->getLock($session_id);
+            }
+            $sql = "SELECT $this->col_expiry, $this->col_data
+                    FROM $this->table_sess WHERE $this->col_sid = :sid";
+            // When using a transaction, SELECT FOR UPDATE is necessary
+            // to avoid deadlock of connection that starts reading
+            // before we write.
+            if ($this->useTransactions) {
+                $sql .= ' FOR UPDATE';
+            }
+            $selectStmt = $this->db->prepare($sql);
+            $selectStmt->bindParam(':sid', $session_id);
+            $selectStmt->execute();
+            $results = $selectStmt->fetch(\PDO::FETCH_ASSOC);
+            if ($results) {
+                if ($results[$this->col_expiry] < time()) {
+                    // Return an empty string if data out of date
+                    return '';
+                }
+                return $results[$this->col_data];
+            }
+            // We'll get this far only if there are no results, which means
+            // the session hasn't yet been registered in the database.
+            if ($this->useTransactions) {
+                $this->initializeRecord($selectStmt);
+            }
+            // Return an empty string if transactions aren't being used
+            // and the session hasn't yet been registered in the database.
+            return '';
+        } catch (\PDOException $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            throw $e;
+        }
     }
 
     /**
@@ -153,5 +193,62 @@ class MysqlSessionHandler implements \SessionHandlerInterface
     {
 
     }
+
+    /**
+ * Executes an application-level lock on the database
+ *
+ * @param $session_id
+ * @return \PDOStatement Prepared statement to release the lock
+ */
+protected function getLock($session_id)
+{
+    $stmt = $this->db->prepare('SELECT GET_LOCK(:key, 50)');
+    $stmt->bindValue(':key', $session_id);
+    $stmt->execute();
+
+    $releaseStmt = $this->db->prepare('DO RELEASE_LOCK(:key)');
+    $releaseStmt->bindValue(':key', $session_id);
+
+    return $releaseStmt;
+}
+
+/**
+ * Registers new session ID in database when using transactions
+ *
+ * Exclusive-reading of non-existent rows does not block, so we need
+ * to insert a row until the transaction is committed.
+ *
+ * @param \PDOStatement $selectStmt
+ * @return string
+ */
+protected function initializeRecord(\PDOStatement $selectStmt)
+{
+    try {
+        $sql = "INSERT INTO $this->table_sess ($this->col_sid, $this->col_expiry, $this->col_data)
+                VALUES (:sid, :expiry, :data)";
+        $insertStmt = $this->db->prepare($sql);
+        $insertStmt->bindParam(':sid', $session_id);
+        $insertStmt->bindParam(':expiry', $this->expiry, \PDO::PARAM_INT);
+        $insertStmt->bindValue(':data', '');
+        $insertStmt->execute();
+        return '';
+    } catch (\PDOException $e) {
+        // Catch duplicate key error if the session has already been created.
+        if (0 === strpos($e->getCode(), '23')) {
+            // Retrieve existing session data written by the current connection.
+            $selectStmt->execute();
+            $results = $selectStmt->fetch(\PDO::FETCH_ASSOC);
+            if ($results) {
+                return $results[$this->col_data];
+            }
+            return '';
+        }
+        // Roll back transaction if the error was caused by something else.
+        if ($this->db->inTransaction()) {
+            $this->db->rollback();
+        }
+        throw $e;
+    }
+}
 
 }
